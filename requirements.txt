@@ -1,0 +1,30 @@
+# Core
+langchain==0.3.0
+langchain-community==0.3.0
+langchain-pinecone==0.2.3
+
+# Vector DB
+pinecone==5.4.2
+
+# Embeddings + Reranker
+sentence-transformers==2.7.0
+
+# LLM
+transformers==4.40.0
+torch>=2.1.0
+
+# Document processing
+pymupdf==1.24.2
+wikipedia==1.4.0
+arxiv==2.1.0
+
+# API
+fastapi==0.111.0
+uvicorn==0.29.0
+python-multipart==0.0.9
+
+# Utilities
+pyyaml==6.0.1
+python-dotenv==1.0.1
+tqdm==4.66.2
+numpy>=1.24.0
