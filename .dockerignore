@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.git
+.gitignore
+logs/
+data/
+checkpoints/
+*.pth
+*.pt
+node_modules/

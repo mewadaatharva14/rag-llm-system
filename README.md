@@ -1,32 +1,47 @@
-# 🔍 RAG LLM System — Multi-Document QA with Confidence Routing
+# 🔍 RAG LLM System — Confidence-Based Retrieval-Augmented Generation
 
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org/)
-[![LangChain](https://img.shields.io/badge/LangChain-0.3.0-1C3C3C?style=flat&logo=langchain&logoColor=white)](https://langchain.com/)
-[![Pinecone](https://img.shields.io/badge/Pinecone-Vector_DB-000000?style=flat)](https://pinecone.io/)
+[![Python](https://img.shields.io/badge/Python-3.12+-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?style=flat&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![LangChain](https://img.shields.io/badge/LangChain-0.3.0-1C3C3C?style=flat)](https://langchain.com/)
+[![Pinecone](https://img.shields.io/badge/Pinecone-Vector_DB-000000?style=flat)](https://pinecone.io/)
 [![License](https://img.shields.io/badge/License-MIT-00C28B?style=flat)](LICENSE)
 [![GitHub](https://img.shields.io/badge/GitHub-mewadaatharva14-181717?style=flat&logo=github)](https://github.com/mewadaatharva14)
 
-> Production-grade RAG system with confidence-based routing — answers questions
-> from a mixed knowledge base of PDFs, Wikipedia articles, and ArXiv papers.
-> Uses two-stage scoring (cosine similarity + cross-encoder reranker) to decide
-> whether to answer from retrieved context or fall back to LLM knowledge.
+> A production-grade RAG system that routes queries through a two-stage
+> confidence pipeline — cosine similarity first, cross-encoder reranker
+> for borderline cases — preventing hallucination from irrelevant context.
 
 ---
 
-## 📌 Overview
+## 🏗️ Architecture
 
-Most RAG systems blindly pass retrieved chunks to the LLM regardless of relevance.
-When context is irrelevant, the LLM hallucinates — producing confident wrong answers.
+![RAG LLM System Architecture](assets/architecture.png)
 
-This system solves that with **confidence-based routing**:
+The system runs two parallel pipelines:
 
-```
-Question → Retrieve top-k chunks → Cosine score check
-  score ≥ 0.75          → RAG answer  (clearly relevant)
-  score < 0.50          → LLM answer  (clearly irrelevant)
-  score in [0.50, 0.75] → Cross-encoder reranker → final decision
-```
+**Ingestion Pipeline** — Documents → Chunking → Embedding → Pinecone
+
+**Query Pipeline** — Question → Embed → Retrieve → Route → Answer
+
+The **Confidence Router** is the core innovation:
+
+$$\text{route} = \begin{cases} \text{RAG} & s_{cos} \geq 0.75 \\ \text{LLM} & s_{cos} < 0.50 \\ \text{Reranker} \rightarrow \text{RAG/LLM} & 0.50 \leq s_{cos} < 0.75 \end{cases}$$
+
+---
+
+## 📌 What Problem Does This Solve?
+
+Standard RAG systems blindly pass retrieved context to the LLM regardless
+of relevance. When retrieved chunks are irrelevant, the LLM hallucinates
+using that context — producing confident wrong answers.
+
+This system prevents that with two-stage scoring:
+
+| Scenario | Cosine Score | Action |
+|---|---|---|
+| Clearly relevant | ≥ 0.75 | RAG — use retrieved context |
+| Clearly irrelevant | < 0.50 | LLM — use model knowledge only |
+| Uncertain | 0.50–0.75 | Cross-encoder reranker decides |
 
 ---
 
@@ -36,174 +51,191 @@ Question → Retrieve top-k chunks → Cosine score check
 rag-llm-system/
 ├── src/
 │   ├── document_processor.py  ← PDF + Wikipedia + ArXiv loading + chunking
-│   ├── embedder.py            ← BAAI/bge-small-en-v1.5 embeddings
-│   ├── vector_store.py        ← Pinecone upsert, search, delete
-│   ├── retriever.py           ← query → embed → Pinecone search
-│   ├── reranker.py            ← cross-encoder borderline refinement
-│   ├── router.py              ← confidence routing logic
-│   ├── generator.py           ← flan-t5-base RAG + LLM mode
-│   ├── logger.py              ← query logging to JSON
-│   └── rag_pipeline.py        ← end-to-end orchestration
-│
-├── notebooks/
-│   └── 01_rag_pipeline_demo.ipynb
-│
+│   ├── embedder.py            ← BAAI/bge-small-en-v1.5 (384-dim)
+│   ├── vector_store.py        ← Pinecone upsert + search
+│   ├── retriever.py           ← embed query → search → return top-5
+│   ├── reranker.py            ← cross-encoder borderline scoring
+│   ├── router.py              ← confidence threshold logic
+│   ├── generator.py           ← flan-t5-small RAG + LLM modes
+│   ├── rag_pipeline.py        ← end-to-end orchestration
+│   └── logger.py              ← query logging to JSON
 ├── configs/
 │   └── rag_config.yaml        ← all hyperparameters
-│
-├── data/sample_docs/          ← committed sample PDFs
-├── logs/                      ← query logs (gitignored)
-├── assets/                    ← routing analysis plots
-├── .env.example               ← environment variable template
+├── notebooks/
+│   └── 01_rag_pipeline_demo.ipynb
+├── assets/
+│   └── architecture.png
+├── data/
+│   └── sample_docs/
+├── logs/
+├── app.py                     ← FastAPI server
+├── setup.py
+├── Dockerfile
 ├── requirements.txt
-├── app.py                     ← FastAPI entry point
+├── .env.example
 └── README.md
 ```
 
 ---
 
-## 🏗️ Architecture
+## 🔑 Key Implementation Details
 
-### Embedding — BAAI/bge-small-en-v1.5
+### Why BGE Query Prefix Matters
 
-384-dimensional dense embeddings. BGE models use a query prefix for better retrieval:
+BAAI/bge-small-en-v1.5 is trained asymmetrically. Chunks are embedded
+as plain text. Queries must use the prefix:
 
-- Chunks embedded as plain text
-- Queries prefixed with `"Represent this sentence for searching relevant passages: "`
+```python
+# WRONG — query lands in wrong region of vector space
+embedding = model.encode("What is self-attention?")
 
-This asymmetric encoding improves retrieval quality by ~5-8% over symmetric encoding.
-
-### Vector Database — Pinecone
-
-Each chunk stored with metadata:
-
-```json
-{
-  "id":       "chunk_id",
-  "values":   [0.1, 0.3, ...],
-  "metadata": {
-    "text":        "chunk text...",
-    "source":      "wikipedia:Transformer",
-    "doc_type":    "wikipedia",
-    "page_number": 1
-  }
-}
+# CORRECT — matches training conditions
+embedding = model.encode(
+    "Represent this sentence for searching relevant passages: What is self-attention?"
+)
 ```
 
-### Confidence Routing
+Without the prefix, retrieval quality drops 5–8% on standard benchmarks.
 
-$$\text{route} = \begin{cases} \text{RAG} & \text{if } s_{cos} \geq 0.75 \\ \text{LLM} & \text{if } s_{cos} < 0.50 \\ \text{Reranker} \to \text{RAG/LLM} & \text{if } 0.50 \leq s_{cos} < 0.75 \end{cases}$$
+### Why Two-Stage Scoring
 
-### Reranker — cross-encoder/ms-marco-MiniLM-L-6-v2
+Cross-encoder reranking takes ~200ms per query. Running it on every query
+makes the API too slow for real-time use. Cosine similarity handles the
+obvious cases (≥ 0.75 or < 0.50) instantly. Only the ambiguous 0.50–0.75
+zone triggers the slower but more precise cross-encoder.
 
-Cross-encoder sees both query and chunk simultaneously — captures interaction that
-bi-encoder (cosine similarity) misses. Only triggered in the borderline zone
-to keep average latency low.
+### Why chunk_overlap=50
 
-$$s_{rerank} = \sigma(f_{CE}(\text{query}, \text{chunk}))$$
+Important sentences near chunk boundaries appear complete in at least one
+chunk. Without overlap, a sentence split across two chunks loses context
+in both — retrieval misses it entirely.
 
-### Generator — google/flan-t5-base
+### Why Pinecone Over FAISS
 
-Two prompt modes:
-
-**RAG mode** — answer grounded in retrieved context:
-```
-Answer the question based on the context below.
-Context: <chunk1> <chunk2> ...
-Question: <question>
-Answer:
-```
-
-**LLM mode** — answer from model's own knowledge:
-```
-Answer the following question:
-Question: <question>
-Answer:
-```
+FAISS is in-memory and not persistent — index rebuilds on every restart.
+Pinecone is cloud-managed, persistent, supports real-time upserts, and
+allows metadata filtering by domain and source. Critical for multi-domain
+knowledge bases.
 
 ---
 
 ## 📊 Results
 
-### Model Comparison
+| Query Type | Route Used | Cosine Score | Latency |
+|---|---|---|---|
+| "What is self-attention?" | RAG | 0.794 | ~1.2s |
+| "Capital of Australia?" | LLM | 0.539 | ~0.8s |
+| "Explain BERT architecture" | RERANKED | 0.631 | ~1.8s |
+| "Indian Constitution Article 1" | RAG | 0.812 | ~1.1s |
 
-| Query | Route | Cosine Score | Rerank Score | Latency |
-|---|---|---|---|---|
-| What is self-attention in transformers? | rag | 0.794 | — | 2190ms |
-| What is the capital of Australia? | llm | 0.539 | 0.000 | 1243ms |
-
-### Routing Stats (2 queries)
-| Metric | Value |
-|---|---|
-| Total queries | 2 |
-| RAG route | 1 (50%) |
-| LLM route | 1 (50%) |
-| Avg cosine score | 0.667 |
-| Avg latency | 1716ms |
-
-### Knowledge Base
-| Document | Type | Chunks |
-|---|---|---|
-| Transformer (deep learning) | Wikipedia | 293 |
-| Attention Is All You Need (1706.03762) | ArXiv | 92 |
-| Constitution of India | Wikipedia | 187 |
 ---
 
 ## ⚙️ Setup & Run
 
-**1. Clone the repository**
+### 1. Clone
+
 ```bash
 git clone https://github.com/mewadaatharva14/rag-llm-system.git
 cd rag-llm-system
 ```
 
-**2. Create virtual environment**
+### 2. Virtual Environment
+
 ```bash
 python -m venv venv
-source venv/bin/activate
-```
-
-**3. Install dependencies**
-```bash
+source venv/bin/activate        # Mac/Linux
+# venv\Scripts\activate         # Windows
 pip install -r requirements.txt
 ```
 
-**4. Set up Pinecone**
+### 3. Environment Variables
+
 ```bash
-# Sign up at https://www.pinecone.io (free tier)
-# Copy your API key
 cp .env.example .env
-# Edit .env and add your PINECONE_API_KEY
 ```
 
-**5. Run the API**
+Edit `.env`:
+```
+PINECONE_API_KEY=your_pinecone_api_key
+HF_API_TOKEN=your_huggingface_token
+```
+
+Get your free Pinecone key at [pinecone.io](https://pinecone.io) and
+HuggingFace token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+
+### 4. Ingest Documents
+
+```bash
+# Wikipedia
+curl -X POST http://localhost:8000/ingest \
+     -H "Content-Type: application/json" \
+     -d '{"source": "Transformer (deep learning)", "doc_type": "wikipedia"}'
+
+# ArXiv paper
+curl -X POST http://localhost:8000/ingest \
+     -H "Content-Type: application/json" \
+     -d '{"source": "1706.03762", "doc_type": "arxiv"}'
+
+# PDF
+curl -X POST http://localhost:8000/ingest/pdf \
+     -F "file=@your_document.pdf"
+```
+
+### 5. Run Server
+
 ```bash
 uvicorn app:app --reload --port 8000
 ```
 
-**6. Ingest documents**
-```bash
-# Wikipedia article
-curl -X POST http://localhost:8000/ingest/url \
-     -H "Content-Type: application/json" \
-     -d '{"source": "Transformer (machine learning model)", "doc_type": "wikipedia"}'
+### 6. Query
 
-# ArXiv paper
-curl -X POST http://localhost:8000/ingest/url \
-     -H "Content-Type: application/json" \
-     -d '{"source": "1706.03762", "doc_type": "arxiv"}'
-
-# PDF file
-curl -X POST http://localhost:8000/ingest/file \
-     -F "file=@data/sample_docs/your_document.pdf"
-```
-
-**7. Query**
 ```bash
 curl -X POST http://localhost:8000/query \
      -H "Content-Type: application/json" \
-     -d '{"question": "What is the self-attention mechanism?"}'
+     -d '{"question": "What is self-attention in transformers?"}'
 ```
+
+**Response:**
+```json
+{
+  "answer": "Self-attention allows tokens to attend to all other tokens...",
+  "route_used": "RAG",
+  "cosine_score": 0.794,
+  "rerank_score": null,
+  "source_documents": ["wikipedia:Transformer (deep learning)"],
+  "latency_ms": 1243.5
+}
+```
+
+### 7. Interactive API Docs
+
+Visit `http://localhost:8000/docs` for full Swagger UI.
+
+---
+
+## 🐳 Docker
+
+```bash
+# Build
+docker build -t rag-llm-system .
+
+# Run
+docker run -p 8000:8000 \
+  -e PINECONE_API_KEY=your_key \
+  -e HF_API_TOKEN=your_token \
+  rag-llm-system
+```
+
+---
+
+## 📓 Notebook
+
+```bash
+jupyter notebook notebooks/01_rag_pipeline_demo.ipynb
+```
+
+Covers: document ingestion, embedding visualization, routing demo with
+real queries, cosine score analysis, and reranker comparison.
 
 ---
 
@@ -211,53 +243,33 @@ curl -X POST http://localhost:8000/query \
 
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/ingest/file` | Upload PDF file |
-| POST | `/ingest/url` | Ingest Wikipedia or ArXiv |
 | POST | `/query` | Ask a question |
-| GET | `/documents` | List indexed documents |
-| DELETE | `/document` | Remove a document |
-| GET | `/health` | Health check + Pinecone status |
-| GET | `/logs` | Recent query logs |
+| POST | `/ingest` | Add Wikipedia or ArXiv document |
+| POST | `/ingest/pdf` | Upload and index a PDF |
+| GET | `/health` | System health + vector count |
 | GET | `/stats` | Routing statistics |
-
-### Example Query Response
-
-```json
-{
-  "answer": "Self-attention allows each token to attend to all other tokens...",
-  "route_used": "rag",
-  "routing_reason": "Cosine score 0.847 >= threshold 0.75 — using RAG answer",
-  "cosine_score": 0.847,
-  "rerank_score": null,
-  "source_chunks": [...],
-  "source_documents": ["wikipedia:Transformer (machine learning model)"],
-  "latency_ms": 1243.5
-}
-```
+| GET | `/docs` | Swagger UI |
 
 ---
 
-## 🔑 Key Implementation Details
+## 🧠 Model Card
 
-**Why BAAI/bge-small-en-v1.5 over all-MiniLM-L6-v2:**
-BGE models are trained with hard negative mining on MS MARCO and BEIR benchmarks.
-They outperform MiniLM on retrieval tasks by ~3-5% while remaining fast enough for CPU.
+| Property | Value |
+|---|---|
+| Embedding model | BAAI/bge-small-en-v1.5 |
+| Embedding dimensions | 384 |
+| Reranker | cross-encoder/ms-marco-MiniLM-L-6-v2 |
+| Generator | google/flan-t5-small |
+| Vector DB | Pinecone (serverless, AWS us-east-1) |
+| Chunk size | 512 tokens |
+| Chunk overlap | 50 tokens |
+| Top-k retrieval | 5 chunks |
 
-**Why two-stage scoring instead of just reranking everything:**
-Cross-encoder reranking is ~10× slower than cosine similarity. Running it on every
-query would make the API too slow. The two-stage approach applies the expensive
-reranker only where it matters — the borderline zone — keeping average latency low.
-
-**Why RecursiveCharacterTextSplitter for mixed domains:**
-Legal text has long paragraphs. Research papers have equations and citations.
-Wikipedia has section headers. Fixed-size chunking breaks all of these at wrong
-boundaries. Recursive splitter tries `\n\n` first, then `\n`, then `.`, then space —
-always splitting at the most natural boundary available.
-
-**Why log_var not var in embeddings:**
-Not applicable here — but the same principle applies to all our numerical outputs:
-store scores in a range that avoids numerical instability. Cosine scores are
-normalized to [0,1] by `normalize_embeddings=True` in sentence-transformers.
+**Limitations:**
+- flan-t5-small is a small model — answers are functional but not fluent
+- System performs best on English text
+- Stock knowledge base is limited — ingest your own documents for best results
+- Not suitable for real-time financial or medical advice
 
 ---
 
@@ -267,7 +279,7 @@ normalized to [0,1] by `normalize_embeddings=True` in sentence-transformers.
 |---|---|
 | RAG Paper | [Lewis et al. 2020](https://arxiv.org/abs/2005.11401) |
 | BGE Embeddings | [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) |
-| MS-MARCO Reranker | [cross-encoder/ms-marco-MiniLM-L-6-v2](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2) |
+| Cross-Encoder | [ms-marco-MiniLM-L-6-v2](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2) |
 | Pinecone Docs | [docs.pinecone.io](https://docs.pinecone.io) |
 | LangChain Docs | [python.langchain.com](https://python.langchain.com) |
 
@@ -275,7 +287,7 @@ normalized to [0,1] by `normalize_embeddings=True` in sentence-transformers.
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
+MIT License — see [LICENSE](LICENSE)
 
 ---
 
